@@ -3,17 +3,16 @@
 """
 Multi-SSC Monitor
 ──────────────────────────────────────────────────────────────
-• Scrapes SSC main & NR sites.
-• Auto-rotating, verified proxy pool for SSC main (geoblocked).
-• Telegram sent without proxy.
+• Auto-scrapes SSC (main + NR) with rotating free proxies.
+• Falls back across up to 10 proxies per request.
+• Telegram notifications sent without proxy.
 """
 
-import os, re, json, time, logging, requests
+import os, re, json, time, logging, requests, re
 from datetime import datetime, timedelta
 from dateutil.parser import parse as dtparse
 from requests.exceptions import ProxyError
 
-# Selenium-Wire
 from seleniumwire import webdriver
 from selenium.common.exceptions import WebDriverException
 from selenium.webdriver.chrome.options import Options
@@ -22,24 +21,22 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 
-# Local proxy helper
 from proxy_pool import get as pick_proxy, ban as ban_proxy
 
-# ───────── CONFIG ─────────
-MAIN_SSC_API = (
-    "https://ssc.gov.in/api/public/noticeboard?page=0&size=50&sort=createdOn,desc"
-)
+# ───────── CONSTANTS ─────────
+MAIN_SSC_API = ("https://ssc.gov.in/api/public/noticeboard"
+                "?page=0&size=50&sort=createdOn,desc")
 MAIN_SSC_URL = "https://ssc.gov.in/home/notice-board"
 SSC_NR_URL   = "https://sscnr.nic.in/newlook/site/Whatsnew.html"
 
 STATE_FILE   = "/data/multi_ssc_state.json"
-LOOKBACK_DAYS = 5
+LOOKBACK_DAYS = 12
 CHECK_INTERVAL = 300
 
 DATE_RE_MAIN = re.compile(r"([A-Za-z]{3})\s+(\d{1,2})\s+(\d{4})")
 DATE_RE_NR   = re.compile(r"\[(\d{1,2})\s+([A-Za-z]{3,9})\s+(\d{4})\]")
 
-# ───────── TELEGRAM (direct) ─────────
+# ───────── TELEGRAM ─────────
 def send_telegram(msg: str) -> bool:
     tok  = os.getenv("TELEGRAM_BOT_TOKEN")
     chat = os.getenv("TELEGRAM_CHAT_ID")
@@ -48,12 +45,8 @@ def send_telegram(msg: str) -> bool:
     try:
         requests.post(
             f"https://api.telegram.org/bot{tok}/sendMessage",
-            data={
-                "chat_id": chat,
-                "text": msg,
-                "parse_mode": "HTML",
-                "disable_web_page_preview": True,
-            },
+            data={"chat_id": chat, "text": msg,
+                  "parse_mode": "HTML", "disable_web_page_preview": True},
             timeout=10,
         ).raise_for_status()
         return True
@@ -90,7 +83,7 @@ def req_proxies():
     return {"http": proxy, "https": proxy} if proxy else None
 
 # ───────── Selenium driver (multi-proxy retry) ─────────
-def new_driver(use_proxy: bool, attempt: int = 1, max_attempts: int = 5):
+def new_driver(use_proxy: bool, attempt=1, max_attempts=10):
     proxy_cfg = swire_opts() if use_proxy else None
     proxy_str = proxy_cfg["proxy"]["http"] if proxy_cfg else "DIRECT"
 
@@ -111,15 +104,15 @@ def new_driver(use_proxy: bool, attempt: int = 1, max_attempts: int = 5):
         if ("ERR_TUNNEL_CONNECTION_FAILED" in str(e)
                 and attempt < max_attempts and proxy_cfg):
             ban_proxy(proxy_str)
-            logging.warning("🚫 Proxy dead %s → retrying (%d/%d)…",
-                            proxy_str, attempt, max_attempts)
+            logging.warning("Proxy %s failed → retry %d/%d", proxy_str,
+                            attempt, max_attempts)
             return new_driver(use_proxy, attempt + 1, max_attempts)
         raise
 
-# ───────── MAIN SSC API (multi-proxy retry) ─────────
-def scrape_main_api(max_attempts: int = 5):
-    attempts = 0
-    while attempts < max_attempts:
+# ───────── MAIN SSC API (retry) ─────────
+def scrape_main_api(max_attempts=10):
+    tries = 0
+    while tries < max_attempts:
         proxy_cfg = req_proxies()
         proxy_str = proxy_cfg["http"] if proxy_cfg else "DIRECT"
         try:
@@ -127,15 +120,15 @@ def scrape_main_api(max_attempts: int = 5):
                                 headers={"User-Agent": "Mozilla/5.0"},
                                 proxies=proxy_cfg)
             resp.raise_for_status()
-            logging.info("✅ API OK via %s", proxy_str)
+            logging.info("API OK via %s", proxy_str)
             break
         except ProxyError:
-            logging.warning("🚫 API proxy failed %s", proxy_str)
             if proxy_cfg:
                 ban_proxy(proxy_str)
-            attempts += 1
+            logging.warning("API proxy failed %s", proxy_str)
+            tries += 1
     else:
-        raise RuntimeError("API: all proxy attempts failed")
+        raise RuntimeError("API exhausted proxies")
 
     data = resp.json()
     cutoff = datetime.utcnow().date() - timedelta(days=LOOKBACK_DAYS)
@@ -149,16 +142,15 @@ def scrape_main_api(max_attempts: int = 5):
             title = item.get("title", "").strip()
             if not title:
                 continue
-            file_url = item.get("fileUrl", "")
-            link = f"https://ssc.gov.in{file_url}" if file_url else None
-            uid = f"main-{notice_date}-{title[:80]}"
+            link = f"https://ssc.gov.in{item.get('fileUrl','')}" or None
+            uid  = f"main-{notice_date}-{title[:80]}"
             out.append({"id": uid, "date": notice_date,
                         "title": title, "link": link, "src": "Main SSC"})
         except Exception:
             continue
     return out
 
-# ───────── MAIN SSC HTML fallback ─────────
+# ───────── MAIN SSC HTML (retry) ─────────
 def scrape_main_html():
     out, drv = [], None
     try:
@@ -202,16 +194,12 @@ def scrape_main_html():
 
 def scrape_main():
     try:
-        notices = scrape_main_api()
-        logging.info("Main SSC API notices: %d", len(notices))
-        return notices
+        return scrape_main_api()
     except Exception as e:
-        logging.warning("API failed → %s. Switching to HTML.", e)
-        notices = scrape_main_html()
-        logging.info("Main SSC HTML notices: %d", len(notices))
-        return notices
+        logging.warning("API failed → %s. Trying HTML.", e)
+        return scrape_main_html()
 
-# ───────── SSC NR SCRAPER (direct) ─────────
+# ───────── NR SCRAPER (direct) ─────────
 def scrape_nr():
     out, drv = [], None
     try:
@@ -226,10 +214,7 @@ def scrape_nr():
 
         cutoff = datetime.utcnow().date() - timedelta(days=LOOKBACK_DAYS)
         for line in html.splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            m = DATE_RE_NR.search(line)
+            m = DATE_RE_NR.search(line.strip())
             if not m:
                 continue
             try:
@@ -289,7 +274,7 @@ if __name__ == "__main__":
     if not (os.getenv("TELEGRAM_BOT_TOKEN") and os.getenv("TELEGRAM_CHAT_ID")):
         raise SystemExit("Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID")
 
-    logging.info("Multi-SSC monitor started (auto-proxy mode)")
+    logging.info("Multi-SSC monitor started (proxy auto-mode)")
     while True:
         try:
             monitor_cycle()
