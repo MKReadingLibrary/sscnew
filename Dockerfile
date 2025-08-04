@@ -14,15 +14,15 @@ RUN apt-get update && \
         wget && \
     apt-get clean && rm -rf /var/lib/apt/lists/*
 
-# Optional: verify versions
+# Optional: show versions
 RUN chromium --version && chromedriver --version
 
-# —— python environment ——
+# —— python env ——
 WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# —— project code ——
+# —— source code ——
 COPY . .
 
 CMD ["python", "main.py"]
