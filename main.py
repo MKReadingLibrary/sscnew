@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Multi-SSC Monitor (API + HTML fallback + Selenium with optional proxy)
+Multi-SSC Monitor (API + HTML fallback + Selenium with proxy, Telegram direct)
 """
 
 import os, re, json, time, logging, random, requests
@@ -9,7 +9,7 @@ from datetime import datetime, timedelta
 from dateutil.parser import parse as dtparse
 
 # ───── selenium & proxy ─────
-from seleniumwire import webdriver          # selenium-wire for proxies
+from seleniumwire import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
@@ -29,15 +29,12 @@ DATE_RE_MAIN = re.compile(r'([A-Za-z]{3})\s+(\d{1,2})\s+(\d{4})')
 DATE_RE_NR   = re.compile(r'\[(\d{1,2})\s+([A-Za-z]{3,9})\s+(\d{4})\]')
 
 # ───────── PROXIES ─────────
-# Provide proxies as a comma-separated list in the env var PROXY_LIST
-PROXY_LIST = [
-    p.strip() for p in os.getenv("PROXY_LIST", "").split(",") if p.strip()
-]
+PROXY_LIST = [p.strip() for p in os.getenv("PROXY_LIST", "").split(",") if p.strip()]
 
-def pick_proxy() -> str | None:
+def pick_proxy():
     return random.choice(PROXY_LIST) if PROXY_LIST else None
 
-def swire_opts() -> dict | None:
+def swire_opts():
     proxy = pick_proxy()
     if not proxy:
         return None
@@ -49,26 +46,30 @@ def swire_opts() -> dict | None:
         }
     }
 
-def req_proxies() -> dict | None:
+def req_proxies():
     proxy = pick_proxy()
-    if not proxy:
-        return None
-    return {"http": proxy, "https": proxy}
+    return {"http": proxy, "https": proxy} if proxy else None
 
-# ───────── TELEGRAM ───────
+# ───────── TELEGRAM (DIRECT) ───────
 def send_telegram(msg: str) -> bool:
-    tok, chat = os.getenv("TELEGRAM_BOT_TOKEN"), os.getenv("TELEGRAM_CHAT_ID")
+    """
+    Send message directly (no proxies) to avoid failures on api.telegram.org.
+    """
+    tok  = os.getenv("TELEGRAM_BOT_TOKEN")
+    chat = os.getenv("TELEGRAM_CHAT_ID")
     if not (tok and chat):
         return False
+
+    url = f"https://api.telegram.org/bot{tok}/sendMessage"
+    data = {
+        "chat_id": chat,
+        "text": msg,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True,
+    }
+
     try:
-        requests.post(
-            f"https://api.telegram.org/bot{tok}/sendMessage",
-            data={"chat_id": chat, "text": msg,
-                  "parse_mode": "HTML",
-                  "disable_web_page_preview": True},
-            timeout=10,
-            proxies=req_proxies()
-        ).raise_for_status()
+        requests.post(url, data=data, timeout=10).raise_for_status()
         return True
     except Exception as e:
         logging.error("Telegram error → %s", e)
@@ -92,7 +93,7 @@ def save_state(s):
         json.dump(s, f, indent=2)
 
 # ───────── SELENIUM HELPER ──────
-def new_driver(use_proxy: bool) -> webdriver.Chrome:
+def new_driver(use_proxy: bool):
     opts = Options()
     opts.binary_location = "/usr/bin/chromium"
     opts.add_argument("--headless=new")
@@ -103,26 +104,23 @@ def new_driver(use_proxy: bool) -> webdriver.Chrome:
 
     sw_opts = swire_opts() if use_proxy else None
     if sw_opts:
-        logging.info("🔄  Using proxy %s", sw_opts["proxy"]["http"])
+        logging.info("🔗 Using proxy %s", sw_opts["proxy"]["http"])
+
     return webdriver.Chrome(service=Service("/usr/bin/chromedriver"),
                             options=opts,
                             seleniumwire_options=sw_opts)
 
 # ───────── MAIN SSC SCRAPERS ──────
 def scrape_main_api():
-    """Try SSC JSON API first (fast) with optional proxy"""
     out = []
     try:
-        resp = requests.get(
-            MAIN_SSC_API,
-            timeout=10,
-            headers={"User-Agent": "Mozilla/5.0"},
-            proxies=req_proxies()
-        )
+        resp = requests.get(MAIN_SSC_API, timeout=10,
+                            headers={"User-Agent": "Mozilla/5.0"},
+                            proxies=req_proxies())
         resp.raise_for_status()
         data = resp.json()
-        cutoff = datetime.utcnow().date() - timedelta(days=LOOKBACK_DAYS)
 
+        cutoff = datetime.utcnow().date() - timedelta(days=LOOKBACK_DAYS)
         for item in data.get("content", []):
             try:
                 date_str = item.get("createdOn", "")[:10]
@@ -143,12 +141,12 @@ def scrape_main_api():
         return out
     except Exception as e:
         logging.warning("Main SSC API failed → %s", e)
-        return None   # trigger HTML fallback
+        return None
 
 def scrape_main_html():
     out, drv = [], None
     try:
-        logging.info("🔄 Trying Main SSC HTML fallback...")
+        logging.info("🔄 HTML fallback for Main SSC…")
         drv = new_driver(use_proxy=True)
         drv.set_page_load_timeout(45)
         drv.execute_cdp_cmd("Network.setBlockedURLs",
@@ -163,8 +161,8 @@ def scrape_main_html():
         cutoff = datetime.utcnow().date() - timedelta(days=LOOKBACK_DAYS)
         for row in drv.find_elements(By.CSS_SELECTOR, "div.flex"):
             try:
-                left_text = row.find_element(By.CSS_SELECTOR, "div.leftSection").text
-                m = DATE_RE_MAIN.search(" ".join(left_text.split()))
+                left = row.find_element(By.CSS_SELECTOR, "div.leftSection").text
+                m = DATE_RE_MAIN.search(" ".join(left.split()))
                 if not m:
                     continue
                 notice_date = dtparse(" ".join(m.groups())).date()
@@ -184,7 +182,7 @@ def scrape_main_html():
                 continue
         logging.info("✅ Main SSC HTML fallback successful")
     except Exception as e:
-        logging.error("❌ Main SSC HTML fallback failed → %s", e)
+        logging.error("Main SSC HTML fallback failed → %s", e)
     finally:
         if drv:
             drv.quit()
@@ -198,11 +196,11 @@ def scrape_main():
 def scrape_nr():
     out, drv = [], None
     try:
-        drv = new_driver(use_proxy=False)   # NR works without a proxy
+        drv = new_driver(use_proxy=False)
         drv.set_page_load_timeout(45)
         drv.execute_cdp_cmd("Network.setBlockedURLs",
-                            {"urls": ["*.png","*.jpg","*.gif","*.svg","*.css",
-                                      "*.js","*.woff*"]})
+                            {"urls": ["*.png","*.jpg","*.gif","*.svg",
+                                      "*.css","*.js","*.woff*"]})
         drv.execute_cdp_cmd("Network.enable", {})
         drv.get(SSC_NR_URL)
         html = drv.page_source
@@ -234,7 +232,7 @@ def scrape_nr():
             drv.quit()
     return out
 
-# ───────── MESSAGES ──────
+# ───────── UTIL ──────
 def format_msg(n):
     icon = "🏛️" if n["src"] == "Main SSC" else "🏢"
     msg = (f"{icon} New {n['src']} Notice\n\n"
@@ -244,23 +242,14 @@ def format_msg(n):
         msg += "🔗 Open"
     return msg
 
-# ───────── MAIN CYCLE ─────────
+# ───────── MAIN CYCLE ──────
 def monitor_cycle():
     state = load_state()
     sent_main = set(state.get("main", []))
     sent_nr   = set(state.get("nr", []))
 
-    try:
-        main_notices = scrape_main()
-    except Exception as e:
-        logging.error("Main scraper completely failed → %s", e)
-        main_notices = []
-
-    try:
-        nr_notices = scrape_nr()
-    except Exception as e:
-        logging.error("NR scraper failed → %s", e)
-        nr_notices = []
+    main_notices = scrape_main() or []
+    nr_notices   = scrape_nr()   or []
 
     main_new = [n for n in main_notices if n["id"] not in sent_main]
     nr_new   = [n for n in nr_notices   if n["id"] not in sent_nr]
@@ -277,7 +266,7 @@ def monitor_cycle():
     state["nr"]   = list(sent_nr)[-500:]
     save_state(state)
 
-# ───────── MAIN LOOP ─────────
+# ───────── MAIN LOOP ──────
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s %(levelname)s %(message)s")
