@@ -2,3 +2,4 @@ selenium==4.21.0
 python-dateutil==2.9.0
 requests==2.31.0
 selenium-wire==5.1.0
+blinker==1.6.2 
