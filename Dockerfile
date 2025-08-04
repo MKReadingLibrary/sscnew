@@ -1,27 +1,21 @@
 FROM python:3.11-slim
 
-# ── system packages ────────────────────────────────────────────
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
-        chromium \
-        chromium-driver \
-        libnss3 \
-        libx11-xcb1 \
-        libatk-bridge2.0-0 \
-        libgtk-3-0 \
-        fonts-liberation \
-        ca-certificates && \
+        openvpn iproute2 \
+        chromium chromium-driver \
+        libnss3 libx11-xcb1 libatk-bridge2.0-0 libgtk-3-0 \
+        fonts-liberation ca-certificates && \
     apt-get clean && rm -rf /var/lib/apt/lists/*
 
-# optional: show versions
-RUN chromium --version && chromedriver --version
-
-# ── python env ─────────────────────────────────────────────────
 WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# ── project code ───────────────────────────────────────────────
-COPY . .
+# project
+COPY main.py            .
+COPY vpn-start.sh       .
+COPY windscribe-india.ovpn .
 
-CMD ["python", "main.py"]
+RUN chmod +x /app/vpn-start.sh
+CMD ["/app/vpn-start.sh"]
