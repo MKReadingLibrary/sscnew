@@ -1,5 +1,5 @@
 selenium==4.21.0
+selenium-wire==5.1.0
 python-dateutil==2.9.0
 requests==2.31.0
-selenium-wire==5.1.0
-blinker==1.6.2 
+blinker==1.6.2          # pin <2.0 so selenium-wire’s mitmproxy works
