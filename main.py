@@ -8,7 +8,7 @@ Multi-SSC Monitor
 • Telegram notifications sent without proxy.
 """
 
-import os, re, json, time, logging, requests, re
+import os, re, json, time, logging, requests
 from datetime import datetime, timedelta
 from dateutil.parser import parse as dtparse
 from requests.exceptions import ProxyError
@@ -127,6 +127,11 @@ def scrape_main_api(max_attempts=10):
                 ban_proxy(proxy_str)
             logging.warning("API proxy failed %s", proxy_str)
             tries += 1
+        except Exception as e:
+            logging.warning("API attempt %d failed: %s", tries + 1, e)
+            if proxy_cfg:
+                ban_proxy(proxy_str)
+            tries += 1
     else:
         raise RuntimeError("API exhausted proxies")
 
@@ -194,10 +199,14 @@ def scrape_main_html():
 
 def scrape_main():
     try:
-        return scrape_main_api()
+        notices = scrape_main_api()
+        logging.info("Main SSC API: %d notices found", len(notices))
+        return notices
     except Exception as e:
         logging.warning("API failed → %s. Trying HTML.", e)
-        return scrape_main_html()
+        notices = scrape_main_html()
+        logging.info("Main SSC HTML: %d notices found", len(notices))
+        return notices
 
 # ───────── NR SCRAPER (direct) ─────────
 def scrape_nr():
@@ -256,7 +265,7 @@ def monitor_cycle():
     main_new = [n for n in main_notices if n["id"] not in sent_main]
     nr_new   = [n for n in nr_notices   if n["id"] not in sent_nr]
 
-    logging.info("Main new: %d | NR new: %d", len(main_new), len(nr_new))
+    logging.info("New notices → Main: %d | NR: %d", len(main_new), len(nr_new))
 
     for notice in main_new + nr_new:
         if send_telegram(format_msg(notice)):
@@ -274,7 +283,7 @@ if __name__ == "__main__":
     if not (os.getenv("TELEGRAM_BOT_TOKEN") and os.getenv("TELEGRAM_CHAT_ID")):
         raise SystemExit("Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID")
 
-    logging.info("Multi-SSC monitor started (proxy auto-mode)")
+    logging.info("🚀 Multi-SSC monitor started (enhanced proxy mode)")
     while True:
         try:
             monitor_cycle()
